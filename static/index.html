@@ -1,0 +1,200 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Event RAG Chatbot</title>
+  <style>
+    :root {
+      font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      background: #0f172a;
+      color: #f8fafc;
+    }
+
+    body {
+      margin: 0;
+      padding: 0;
+      min-height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+
+    .app {
+      width: min(800px, 100%);
+      height: min(90vh, 720px);
+      background: #1e293b;
+      border-radius: 16px;
+      box-shadow: 0 25px 60px rgba(15, 23, 42, 0.65);
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+      border: 1px solid rgba(148, 163, 184, 0.15);
+    }
+
+    header {
+      padding: 20px 24px;
+      border-bottom: 1px solid rgba(148, 163, 184, 0.25);
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+
+    header h1 {
+      margin: 0;
+      font-size: 1.4rem;
+      letter-spacing: 0.4px;
+    }
+
+    #chat-log {
+      flex: 1;
+      overflow-y: auto;
+      padding: 24px;
+      display: flex;
+      flex-direction: column;
+      gap: 16px;
+    }
+
+    .message {
+      padding: 16px;
+      border-radius: 14px;
+      line-height: 1.5;
+      max-width: 75%;
+    }
+
+    .user {
+      align-self: flex-end;
+      background: #2563eb;
+    }
+
+    .assistant {
+      align-self: flex-start;
+      background: rgba(15, 23, 42, 0.75);
+      border: 1px solid rgba(148, 163, 184, 0.2);
+    }
+
+    .documents {
+      margin-top: 12px;
+      padding-top: 12px;
+      border-top: 1px solid rgba(148, 163, 184, 0.15);
+      font-size: 0.85rem;
+      color: #cbd5f5;
+    }
+
+    form {
+      display: flex;
+      gap: 12px;
+      padding: 20px 24px;
+      border-top: 1px solid rgba(148, 163, 184, 0.25);
+      background: rgba(15, 23, 42, 0.65);
+    }
+
+    input {
+      flex: 1;
+      padding: 14px 16px;
+      border-radius: 12px;
+      border: 1px solid rgba(148, 163, 184, 0.3);
+      background: rgba(15, 23, 42, 0.35);
+      color: #f8fafc;
+      font-size: 1rem;
+    }
+
+    button {
+      padding: 0 24px;
+      border-radius: 12px;
+      border: none;
+      background: #22c55e;
+      color: #0f172a;
+      font-weight: 600;
+      cursor: pointer;
+    }
+
+    button[disabled] {
+      opacity: 0.7;
+      cursor: not-allowed;
+    }
+  </style>
+</head>
+
+<body>
+  <div class="app">
+    <header>
+      <h1>Event RAG Chatbot</h1>
+      <small>LangGraph + FastAPI</small>
+    </header>
+
+    <main id="chat-log"></main>
+
+    <form id="chat-form">
+      <input id="user-input" type="text" placeholder="Ask about events..." autocomplete="off" required />
+      <button type="submit">Send</button>
+    </form>
+  </div>
+
+  <script>
+    const form = document.getElementById("chat-form");
+    const input = document.getElementById("user-input");
+    const chatLog = document.getElementById("chat-log");
+
+    function appendMessage(role, text, documents = []) {
+      const messageEl = document.createElement("div");
+      messageEl.className = `message ${role}`;
+      messageEl.innerText = text;
+
+      if (documents.length > 0) {
+        const docsEl = document.createElement("div");
+        docsEl.className = "documents";
+        docsEl.innerHTML = "<strong>Context used:</strong><br>" + documents.map((doc) => `• ${doc.title}: ${doc.preview}`).join("<br>");
+        messageEl.appendChild(docsEl);
+      }
+
+      chatLog.appendChild(messageEl);
+      chatLog.scrollTop = chatLog.scrollHeight;
+    }
+
+    async function sendMessage(text) {
+      appendMessage("user", text);
+      input.value = "";
+      input.focus();
+
+      const submitButton = form.querySelector("button");
+      submitButton.disabled = true;
+      submitButton.innerText = "Thinking...";
+
+      try {
+        const response = await fetch("/chat", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ message: text }),
+        });
+
+        if (!response.ok) {
+          const error = await response.json();
+          throw new Error(error.detail || "Request failed");
+        }
+
+        const data = await response.json();
+        appendMessage("assistant", data.response, data.documents);
+      } catch (error) {
+        appendMessage("assistant", `Something went wrong: ${error.message}`);
+      } finally {
+        submitButton.disabled = false;
+        submitButton.innerText = "Send";
+      }
+    }
+
+    form.addEventListener("submit", (event) => {
+      event.preventDefault();
+      const text = input.value.trim();
+      if (text) {
+        sendMessage(text);
+      }
+    });
+
+    appendMessage("assistant", "Hi! Ask me about upcoming events, venues, or ticket prices.");
+  </script>
+</body>
+
+</html>
+
