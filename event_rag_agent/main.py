@@ -122,6 +122,7 @@ class AgentState(TypedDict):
     needs_clarification: bool
     clarification_attempts: int
     preferences: Dict[str, Any]
+    is_event_query: bool
 
 
 # ==================== PREFERENCE HELPERS ====================
@@ -218,6 +219,43 @@ search_tool_map = {tool.name: tool for tool in search_tools}
 search_llm = llm.bind_tools(search_tools)
 
 
+SEARCH_INTENT_PROMPT = """
+Examples:
+User: "my city is pune"
+Classification: EVENT_QUERY
+
+User: "budget under 1000"
+Classification: EVENT_QUERY
+
+User: "I want to find events"
+Classification: NEEDS_DETAILS
+
+User: "events"
+Classification: NEEDS_DETAILS
+
+User: "hi"
+Classification: SMALL_TALK
+
+User: "thanks"  
+Classification: SMALL_TALK
+
+Now classify this message. Respond with exactly one token:
+- 'EVENT_QUERY' if the user is clearly asking about events or providing enough info to search.
+- 'NEEDS_DETAILS' if the user mentions events but the request is too vague and needs clarification.
+- 'SMALL_TALK' if the user is greeting, acknowledging, or casually reacting.
+
+First, analyze what information the user has provided about their event search.
+Then classify the intent.
+
+Analysis:
+- Does the message contain location, budget, event type, or dates? 
+- Is it part of an ongoing conversation?
+
+Classification (respond with exactly one): EVENT_QUERY, NEEDS_DETAILS, or SMALL_TALK
+"""
+
+
+
 def looks_like_error_page(content: str) -> bool:
     """Detect whether the LLM output appears to be an HTML error page."""
     if not content:
@@ -228,6 +266,86 @@ def looks_like_error_page(content: str) -> bool:
     if any(probe.startswith(tag) for tag in html_indicators):
         return True
     return "cloudflare" in probe or "<script" in probe
+
+
+EVENT_BOUNDARY_PROMPT = (
+    "Classify whether the latest user message is still within scope for an events "
+    "chatbot that is already in conversation with the user. Respond with exactly "
+    "one token:\n"
+    "- 'IN_SCOPE' if the user is greeting, acknowledging the assistant (e.g., 'hel''cool', "
+    "'thanks'), making small talk, asking about events, or sharing context like city, "
+    "budget, interests, or dates to guide event suggestions. Treat follow-up "
+    "reactions to prior event recommendations as IN_SCOPE even if they do not mention "
+    "events explicitly.\n"
+    "- 'OUT_OF_SCOPE' only when the user asks for information unrelated to events or "
+    "requests tasks far outside event assistance (e.g., explain quantum physics, "
+    "stock advice, coding help, trivia about planets)."
+)
+
+
+def enforce_event_boundary(state: AgentState) -> dict:
+    """Ensure the query is event-related before proceeding."""
+    latest_user_message = next(
+        (msg for msg in reversed(state["messages"]) if isinstance(msg, HumanMessage)),
+        None,
+    )
+    if latest_user_message is None:
+        return {"is_event_query": True}
+
+    user_text = (latest_user_message.content or "").strip()
+    if not user_text:
+        return {"is_event_query": True}
+
+    event_related = True
+    try:
+        decision = llm.invoke(
+            [
+                SystemMessage(content=EVENT_BOUNDARY_PROMPT),
+                HumanMessage(content=user_text),
+            ]
+        )
+        verdict = (decision.content or "").strip().lower()
+        event_related = verdict.startswith("in_scope")
+    except Exception as exc:
+        print(f"[BOUNDARY] Boundary LLM failed: {exc}. Allowing query.")
+        event_related = True
+
+    if event_related:
+        return {"is_event_query": True}
+
+    print(f"[BOUNDARY] Blocked non-event query: '{user_text}'")
+    off_topic_message = AIMessage(
+        content="I'm your event chatbot. Please ask me questions related to events.",
+        additional_kwargs={"off_topic": True},
+    )
+    return {
+        "messages": [off_topic_message],
+        "is_event_query": False,
+        "documents": [],
+        "should_retrieve": False,
+        "needs_clarification": False,
+    }
+
+
+def classify_search_intent(text: str) -> str:
+    """Use the LLM to decide how to treat the latest user query."""
+    normalized = (text or "").strip()
+    if not normalized:
+        return "SMALL_TALK"
+
+    try:
+        decision = llm.invoke(
+            [
+                SystemMessage(content=SEARCH_INTENT_PROMPT),
+                HumanMessage(content=normalized),
+            ]
+        )
+        label = (decision.content or "").strip().upper()
+        if label in {"EVENT_QUERY", "NEEDS_DETAILS", "SMALL_TALK"}:
+            return label
+    except Exception as exc:
+        print(f"[SEARCH] Intent classifier failed: {exc}. Defaulting to EVENT_QUERY.")
+    return "EVENT_QUERY"
 
 
 def format_preferences(preferences: Dict[str, Any]) -> str:
@@ -306,27 +424,17 @@ def maybe_search_events(state: AgentState) -> dict:
         return {"query": "", "should_retrieve": False}
 
     query = latest_user_message.content
-    query_lower = query.lower().strip()
-    words = query_lower.split()
+    intent = classify_search_intent(query)
+    if intent == "SMALL_TALK":
+        print(f"[SEARCH] Small talk detected: '{query}' - skipping retrieval.")
+        return {
+            "query": query,
+            "should_retrieve": False,
+            "needs_clarification": False,
+        }
 
-    # Check if query is too vague for search
-    ambiguous_phrases = {
-        "event",
-        "events",
-        "tell me more",
-        "tell me something",
-        "more details",
-        "help",
-        "info",
-    }
-    
-    needs_clarification = (
-        len(words) < 3
-        or query_lower in ambiguous_phrases
-    ) and state.get("clarification_attempts", 0) < 2
-
-    if needs_clarification:
-        print(f"[SEARCH] Query too vague: '{query}' - needs clarification")
+    if intent == "NEEDS_DETAILS" and state.get("clarification_attempts", 0) < 2:
+        print(f"[SEARCH] Query needs clarification: '{query}'")
         return {
             "query": query,
             "should_retrieve": False,
@@ -482,18 +590,33 @@ def route_after_search(state: AgentState) -> str:
     return "generate"
 
 
+def route_guardrail(state: AgentState) -> str:
+    """Determine whether to continue after the guardrail."""
+    return "search" if state.get("is_event_query", True) else "stop"
+
+
 # ==================== BUILD LANGGRAPH ====================
 
 workflow = StateGraph(AgentState)
 
 workflow.add_node("preferences", maybe_update_preferences)
+workflow.add_node("guardrail", enforce_event_boundary)
 workflow.add_node("search", maybe_search_events)
 workflow.add_node("clarify", ask_clarifying_question)
 workflow.add_node("generate", generate_response)
 
 workflow.set_entry_point("preferences")
 
-workflow.add_edge("preferences", "search")
+workflow.add_edge("preferences", "guardrail")
+
+workflow.add_conditional_edges(
+    "guardrail",
+    route_guardrail,
+    {
+        "search": "search",
+        "stop": END,
+    },
+)
 
 workflow.add_conditional_edges(
     "search",
@@ -532,8 +655,9 @@ def run_agent(
         "needs_clarification": False,
         "clarification_attempts": clarification_attempts,
         "preferences": load_preferences(),
+        "is_event_query": True,
     }
-    
+
     print(f"\n{'='*70}")
     print(f"USER QUERY: {user_query}")
     print(f"{'='*70}")
