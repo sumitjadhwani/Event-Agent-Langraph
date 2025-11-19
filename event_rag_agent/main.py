@@ -11,6 +11,7 @@ from langchain_community.vectorstores import FAISS
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_core.messages import BaseMessage, HumanMessage, AIMessage, SystemMessage
 from langchain_core.tools import tool
+from langchain_core.documents import Document
 from langchain_groq import ChatGroq
 from langgraph.graph import StateGraph, END
 from langgraph.graph.message import add_messages
@@ -152,8 +153,8 @@ def update_preferences_from_text(text: str, current: Dict[str, Any]) -> Dict[str
     return updated
 
 
-@tool("update_user_preferences")
-def update_preferences_tool(
+@tool("user_profile_tool")
+def UserProfileTool(
     text: str,
     current_preferences: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
@@ -166,17 +167,55 @@ def update_preferences_tool(
     return {"preferences": updated, "changed": changed}
 
 
+@tool("event_search_tool")
+def EventSearchTool(query: str) -> List[Dict[str, Any]]:
+    """Search for events in the database using semantic search. Returns a list of relevant event documents."""
+    try:
+        docs = retriever.invoke(query)
+        
+        print(f"[RETRIEVAL] Found {len(docs)} documents")
+        for i, doc in enumerate(docs):
+            print(f"  - Doc {i+1}: {doc.page_content[:100]}...")
+        
+        # Convert documents to a serializable format
+        result = []
+        for doc in docs:
+            result.append({
+                "page_content": doc.page_content,
+                "metadata": getattr(doc, "metadata", {}) or {}
+            })
+        
+        return result
+    
+    except Exception as e:
+        print(f"[RETRIEVAL ERROR] {e}")
+        return []
+
+
 PREFERENCE_SYSTEM_PROMPT = (
     "You review the most recent user message and determine whether it contains new "
     "information about their preferred city, budget, or interests.\n"
-    "- If it does, call the `update_user_preferences` tool exactly once, passing the "
+    "- If it does, call the `user_profile_tool` tool exactly once, passing the "
     "raw user text and the current preferences.\n"
     "- If there is no new information, respond with 'No preference update needed.'"
 )
 
-preference_tools = [update_preferences_tool]
+preference_tools = [UserProfileTool]
 preference_tool_map = {tool.name: tool for tool in preference_tools}
 preference_llm = llm.bind_tools(preference_tools)
+
+SEARCH_SYSTEM_PROMPT = (
+    "You review the user's query and determine if they are asking about specific events, "
+    "event details, or need information from the event database.\n"
+    "- If the query asks about events (e.g., 'what events', 'show me concerts', 'find workshops'), "
+    "call the `event_search_tool` with the user's query as the search term.\n"
+    "- If the query is too vague or unclear, respond with 'No search needed - query too vague.'\n"
+    "- If the query is a general question that doesn't require event search, respond with 'No search needed.'"
+)
+
+search_tools = [EventSearchTool]
+search_tool_map = {tool.name: tool for tool in search_tools}
+search_llm = llm.bind_tools(search_tools)
 
 
 def looks_like_error_page(content: str) -> bool:
@@ -257,19 +296,20 @@ def maybe_update_preferences(state: AgentState) -> dict:
     return {}
 
 
-def decide_to_retrieve(state: AgentState) -> dict:
-    """Analyze query to decide if retrieval is needed or if a clarification loop is required."""
-    query = state["messages"][-1].content
+def maybe_search_events(state: AgentState) -> dict:
+    """Let the LLM decide whether to call the event search tool."""
+    latest_user_message = next(
+        (msg for msg in reversed(state["messages"]) if isinstance(msg, HumanMessage)),
+        None,
+    )
+    if latest_user_message is None:
+        return {"query": "", "should_retrieve": False}
+
+    query = latest_user_message.content
     query_lower = query.lower().strip()
     words = query_lower.split()
 
-    knowledge_keywords = [
-        "what", "how", "explain", "describe", "tell me about",
-        "define", "who is", "why", "when", "where", "which",
-        "event", "show", "find", "search", "list", "price",
-        "concert", "workshop", "conference", "meetup",
-    ]
-
+    # Check if query is too vague for search
     ambiguous_phrases = {
         "event",
         "events",
@@ -279,24 +319,67 @@ def decide_to_retrieve(state: AgentState) -> dict:
         "help",
         "info",
     }
-
-    should_retrieve = any(keyword in query_lower for keyword in knowledge_keywords)
+    
     needs_clarification = (
         len(words) < 3
         or query_lower in ambiguous_phrases
-        or not should_retrieve
     ) and state.get("clarification_attempts", 0) < 2
 
-    print(
-        f"[DECISION] Query: '{query}' | Retrieve: {should_retrieve} | Clarify: {needs_clarification}"
-    )
+    if needs_clarification:
+        print(f"[SEARCH] Query too vague: '{query}' - needs clarification")
+        return {
+            "query": query,
+            "should_retrieve": False,
+            "needs_clarification": True,
+        }
 
-    return {
-        "query": query,
-        "should_retrieve": should_retrieve,
-        "needs_clarification": needs_clarification,
-        "preferences": state["preferences"],
-    }
+    try:
+        decision = search_llm.invoke(
+            [
+                SystemMessage(content=SEARCH_SYSTEM_PROMPT),
+                HumanMessage(content=query),
+            ]
+        )
+    except Exception as exc:
+        print(f"[SEARCH] Search LLM failed: {exc}")
+        return {"query": query, "should_retrieve": False}
+
+    tool_calls = getattr(decision, "tool_calls", None)
+    if not tool_calls:
+        print(f"[SEARCH] No search needed for query: '{query}'")
+        return {"query": query, "should_retrieve": False}
+
+    retrieved_docs = []
+    for tool_call in tool_calls:
+        tool_name = tool_call.get("name")
+        selected_tool = search_tool_map.get(tool_name)
+        if selected_tool is None:
+            continue
+
+        tool_args = dict(tool_call.get("args") or {})
+        search_query = tool_args.get("query", query)
+
+        try:
+            result = selected_tool.invoke({"query": search_query})
+            if isinstance(result, list):
+                # Convert back to document-like objects for compatibility
+                retrieved_docs = [
+                    Document(page_content=item.get("page_content", ""), metadata=item.get("metadata", {}))
+                    for item in result
+                ]
+        except Exception as exc:
+            print(f"[SEARCH] Tool '{tool_name}' failed: {exc}")
+            continue
+
+    if retrieved_docs:
+        print(f"[SEARCH] Retrieved {len(retrieved_docs)} documents via tool call")
+        return {
+            "query": query,
+            "documents": retrieved_docs,
+            "should_retrieve": True,
+        }
+
+    return {"query": query, "should_retrieve": False}
 def ask_clarifying_question(state: AgentState) -> dict:
     """Ask the user for clarification before retrieving."""
     query = state["messages"][-1].content
@@ -329,24 +412,6 @@ def ask_clarifying_question(state: AgentState) -> dict:
         "needs_clarification": False,
     }
 
-
-
-def retrieve_documents(state: AgentState) -> dict:
-    """Retrieve relevant documents from vector store."""
-    query = state["query"]
-    
-    try:
-        docs = retriever.invoke(query)
-        
-        print(f"[RETRIEVAL] Found {len(docs)} documents")
-        for i, doc in enumerate(docs):
-            print(f"  - Doc {i+1}: {doc.page_content[:100]}...")
-        
-        return {"documents": docs}
-    
-    except Exception as e:
-        print(f"[RETRIEVAL ERROR] {e}")
-        return {"documents": []}
 
 
 def generate_response(state: AgentState) -> dict:
@@ -410,11 +475,11 @@ User preferences (if provided):
 
 # ==================== ROUTING LOGIC ====================
 
-def route_after_decision(state: AgentState) -> str:
-    """Route to clarification, retrieval or direct generation."""
+def route_after_search(state: AgentState) -> str:
+    """Route to clarification or direct generation after search."""
     if state.get("needs_clarification"):
         return "clarify"
-    return "retrieve" if state["should_retrieve"] else "generate"
+    return "generate"
 
 
 # ==================== BUILD LANGGRAPH ====================
@@ -422,27 +487,24 @@ def route_after_decision(state: AgentState) -> str:
 workflow = StateGraph(AgentState)
 
 workflow.add_node("preferences", maybe_update_preferences)
-workflow.add_node("decide", decide_to_retrieve)
+workflow.add_node("search", maybe_search_events)
 workflow.add_node("clarify", ask_clarifying_question)
-workflow.add_node("retrieve", retrieve_documents)
 workflow.add_node("generate", generate_response)
 
 workflow.set_entry_point("preferences")
 
-workflow.add_edge("preferences", "decide")
+workflow.add_edge("preferences", "search")
 
 workflow.add_conditional_edges(
-    "decide",
-    route_after_decision,
+    "search",
+    route_after_search,
     {
         "clarify": "clarify",
-        "retrieve": "retrieve",
         "generate": "generate"
     }
 )
 
 workflow.add_edge("clarify", END)
-workflow.add_edge("retrieve", "generate")
 workflow.add_edge("generate", END)
 
 app = workflow.compile()
